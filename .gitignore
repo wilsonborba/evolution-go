@@ -22,3 +22,8 @@ carousel-sender.html
 
 # Generated release directories (built by tools/build-dist/)
 dist/
+
+# Python cache / runtime state for tools/webhook-listener
+__pycache__/
+*.pyc
+tools/webhook-listener/.port

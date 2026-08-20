@@ -35,6 +35,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
+	conversationmessage_model "github.com/EvolutionAPI/evolution-go/pkg/conversationmessage/model"
+	conversationmessage_repository "github.com/EvolutionAPI/evolution-go/pkg/conversationmessage/repository"
 	producer_interfaces "github.com/EvolutionAPI/evolution-go/pkg/events/interfaces"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	instance_repository "github.com/EvolutionAPI/evolution-go/pkg/instance/repository"
@@ -70,10 +72,11 @@ type clientVersion struct {
 }
 
 type whatsmeowService struct {
-	instanceRepository instance_repository.InstanceRepository
-	authDB             *sql.DB
-	messageRepository  message_repository.MessageRepository
-	labelRepository    label_repository.LabelRepository
+	instanceRepository            instance_repository.InstanceRepository
+	authDB                        *sql.DB
+	messageRepository             message_repository.MessageRepository
+	conversationMessageRepository conversationmessage_repository.ConversationMessageRepository
+	labelRepository               label_repository.LabelRepository
 	pollService        poll_service.PollService // NOVO: Serviço de enquetes
 	config             *config.Config
 	killChannel        map[string](chan bool)
@@ -294,21 +297,29 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	var container *sqlstore.Container
 
+	var dbLog waLog.Logger
 	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	if w.config.PostgresAuthDB != "" && w.authDB != nil {
+		// Reuse the already-pooled, bounded authDB connection (SetMaxOpenConns/SetMaxIdleConns
+		// are configured once in config.CreateAuthDB) instead of opening a brand new *sql.DB via
+		// sqlstore.New on every StartClient call. StartClient runs on every reconnect, including
+		// the kill-channel restart path, so calling sqlstore.New here leaked one unbounded
+		// connection pool per call (see issue #175).
+		container = sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
+		if err = container.Upgrade(context.Background()); err != nil {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to upgrade container: %v", cd.Instance.Id, err)
+			return
 		}
+	} else if w.config.PostgresAuthDB != "" {
+		// authDB should always be set when PostgresAuthDB is configured (see main.go), but fall
+		// back to the old per-call behavior rather than panicking on a nil *sql.DB.
+		container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
 	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
 	}
 
 	if err != nil {
@@ -368,17 +379,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
 		}
 	} else {
-		// Try to fetch version from WhatsApp Web
-		webVersion, err := fetchWhatsAppWebVersion()
-		if err != nil {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to fetch WhatsApp Web version: %v", cd.Instance.Id, err)
-		} else {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from web to %d.%d.%d", cd.Instance.Id, webVersion.Major, webVersion.Minor, webVersion.Patch)
-			version = *webVersion
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
-		}
+		// Scraping web.whatsapp.com for the current client version is
+		// unreliable (see evolution-foundation/evolution-go#3) -- the
+		// whatsmeow maintainer's consistent guidance across upstream
+		// issues (tulir/whatsmeow#1164, #1040, #941, ...) is that the
+		// version should come from whatsmeow-lib's own hardcoded default
+		// (store.waVersion, kept current via submodule updates), not from
+		// scraping WhatsApp's site. DeviceProps.Version is left at
+		// whatever whatsmeow-lib initializes it to.
 	}
 
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
@@ -1988,6 +1996,15 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 		return
 	}
 
+	// Persist actual message content straight to Postgres, independent of
+	// whatever RabbitMQ/NATS/WebSocket/Webhook subscriptions this instance
+	// has configured -- capture must not depend on external delivery
+	// config. Runs for both incoming (Message) and outgoing (SendMessage)
+	// paths since both flow through this same function.
+	if (eventType == "Message" || eventType == "SendMessage") && w.conversationMessageRepository != nil {
+		go w.persistConversationMessage(instance, eventType, data, jsonData)
+	}
+
 	eventArray := strings.Split(instance.Events, ",")
 
 	var subscriptions []string
@@ -2130,6 +2147,94 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 
 	default:
 		return
+	}
+}
+
+// extractMessageText mirrors the shapes actually observed on the wire
+// (conversation, extendedTextMessage, image/video/document caption).
+// Returns "" rather than guessing for shapes it doesn't recognize (pure
+// media, reactions, protocol messages, etc.).
+func extractMessageText(messageObj map[string]interface{}) string {
+	if messageObj == nil {
+		return ""
+	}
+	if conv, ok := messageObj["conversation"].(string); ok && conv != "" {
+		return conv
+	}
+	for _, key := range []string{"extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"} {
+		node, ok := messageObj[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if text, ok := node["text"].(string); ok && text != "" {
+			return text
+		}
+		if caption, ok := node["caption"].(string); ok && caption != "" {
+			return caption
+		}
+	}
+	return ""
+}
+
+// persistConversationMessage writes a normalized row into
+// conversation_messages for a live Message/SendMessage event. Deduplication
+// (chat_jid, message_id) means it's always safe to call, even if a future
+// history-sync backfill later offers the same message again -- see
+// ConversationMessageRepository.Upsert. Never allowed to affect the
+// webhook/queue dispatch path: any failure here is only logged.
+func (w *whatsmeowService) persistConversationMessage(instance *instance_model.Instance, eventType string, data map[string]interface{}, rawJSON []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Panic persisting conversation message: %v", instance.Id, r)
+		}
+	}()
+
+	inner, _ := data["data"].(map[string]interface{})
+	info, _ := inner["Info"].(map[string]interface{})
+	if info == nil {
+		return
+	}
+
+	messageID, _ := info["ID"].(string)
+	chatJID, _ := info["Chat"].(string)
+	if messageID == "" || chatJID == "" {
+		return
+	}
+
+	messageObj, _ := inner["Message"].(map[string]interface{})
+	textBody := extractMessageText(messageObj)
+
+	var isFromMe *bool
+	if v, ok := info["IsFromMe"].(bool); ok {
+		isFromMe = &v
+	}
+
+	var waTimestamp *time.Time
+	if ts, ok := info["Timestamp"].(string); ok && ts != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			waTimestamp = &parsed
+		}
+	}
+
+	senderJID, _ := info["Sender"].(string)
+	pushName, _ := info["PushName"].(string)
+	messageType, _ := info["Type"].(string)
+
+	row := conversationmessage_model.ConversationMessage{
+		MessageID:   messageID,
+		ChatJID:     chatJID,
+		IsFromMe:    isFromMe,
+		SenderJID:   senderJID,
+		PushName:    pushName,
+		MessageType: messageType,
+		TextBody:    textBody,
+		WaTimestamp: waTimestamp,
+		CapturedVia: "live",
+		Raw:         string(rawJSON),
+	}
+
+	if err := w.conversationMessageRepository.Upsert(row); err != nil {
+		w.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to persist conversation message %s: %v", instance.Id, messageID, err)
 	}
 }
 
@@ -2650,6 +2755,7 @@ func NewWhatsmeowService(
 	instanceRepository instance_repository.InstanceRepository,
 	authDB *sql.DB,
 	messageRepository message_repository.MessageRepository,
+	conversationMessageRepository conversationmessage_repository.ConversationMessageRepository,
 	labelRepository label_repository.LabelRepository,
 	config *config.Config,
 	killChannel map[string](chan bool),
@@ -2667,10 +2773,11 @@ func NewWhatsmeowService(
 	pollSvc := poll_service.NewPollService(authDB, loggerWrapper)
 
 	return &whatsmeowService{
-		instanceRepository: instanceRepository,
-		authDB:             authDB,
-		messageRepository:  messageRepository,
-		labelRepository:    labelRepository,
+		instanceRepository:            instanceRepository,
+		authDB:                        authDB,
+		messageRepository:             messageRepository,
+		conversationMessageRepository: conversationMessageRepository,
+		labelRepository:               labelRepository,
 		pollService:        pollSvc, // NOVO: Serviço de enquetes
 		config:             config,
 		killChannel:        killChannel,
