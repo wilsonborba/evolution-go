@@ -25,6 +25,8 @@ import (
 	call_service "github.com/EvolutionAPI/evolution-go/pkg/call/service"
 	chat_handler "github.com/EvolutionAPI/evolution-go/pkg/chat/handler"
 	chat_service "github.com/EvolutionAPI/evolution-go/pkg/chat/service"
+	conversationmessage_model "github.com/EvolutionAPI/evolution-go/pkg/conversationmessage/model"
+	conversationmessage_repository "github.com/EvolutionAPI/evolution-go/pkg/conversationmessage/repository"
 	community_handler "github.com/EvolutionAPI/evolution-go/pkg/community/handler"
 	community_service "github.com/EvolutionAPI/evolution-go/pkg/community/service"
 	config "github.com/EvolutionAPI/evolution-go/pkg/config"
@@ -159,12 +161,14 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 
 	instanceRepository := instance_repository.NewInstanceRepository(db)
 	messageRepository := message_repository.NewMessageRepository(db)
+	conversationMessageRepository := conversationmessage_repository.NewConversationMessageRepository(db)
 	labelRepository := label_repository.NewLabelRepository(db)
 
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(
 		instanceRepository,
 		authDB,
 		message_repository.NewMessageRepository(db),
+		conversationMessageRepository,
 		labelRepository,
 		config,
 		killChannel,
@@ -257,7 +261,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 }
 
 func migrate(db *gorm.DB) {
-	err := db.AutoMigrate(&instance_model.Instance{}, &message_model.Message{}, &label_model.Label{})
+	err := db.AutoMigrate(&instance_model.Instance{}, &message_model.Message{}, &label_model.Label{}, &conversationmessage_model.ConversationMessage{})
 
 	if err != nil {
 		log.Fatal(err)
