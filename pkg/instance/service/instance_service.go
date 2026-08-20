@@ -72,7 +72,7 @@ type CreateStruct struct {
 }
 
 type ConnectStruct struct {
-	WebhookUrl      string   `json:"webhookUrl"`
+	WebhookUrl      *string  `json:"webhookUrl"`
 	Subscribe       []string `json:"subscribe"`
 	Immediate       bool     `json:"immediate"`
 	Phone           string   `json:"phone"`
@@ -222,7 +222,9 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	eventString := strings.Join(subscribedEvents, ",")
 
 	instance.Events = eventString
-	instance.Webhook = data.WebhookUrl
+	if data.WebhookUrl != nil {
+		instance.Webhook = *data.WebhookUrl
+	}
 	instance.RabbitmqEnable = data.RabbitmqEnable
 	instance.NatsEnable = data.NatsEnable
 	instance.WebSocketEnable = data.WebSocketEnable
