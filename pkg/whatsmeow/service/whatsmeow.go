@@ -376,17 +376,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
 		}
 	} else {
-		// Try to fetch version from WhatsApp Web
-		webVersion, err := fetchWhatsAppWebVersion()
-		if err != nil {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to fetch WhatsApp Web version: %v", cd.Instance.Id, err)
-		} else {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from web to %d.%d.%d", cd.Instance.Id, webVersion.Major, webVersion.Minor, webVersion.Patch)
-			version = *webVersion
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
-		}
+		// Scraping web.whatsapp.com for the current client version is
+		// unreliable (see evolution-foundation/evolution-go#3) -- the
+		// whatsmeow maintainer's consistent guidance across upstream
+		// issues (tulir/whatsmeow#1164, #1040, #941, ...) is that the
+		// version should come from whatsmeow-lib's own hardcoded default
+		// (store.waVersion, kept current via submodule updates), not from
+		// scraping WhatsApp's site. DeviceProps.Version is left at
+		// whatever whatsmeow-lib initializes it to.
 	}
 
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
